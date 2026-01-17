@@ -1,0 +1,859 @@
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options(digits = 20)
+rm(list=ls())
+
+
+
+
+library(tidyverse)
+library(rugarch)
+library(roll)
+library(ggplot2)
+library(e1071)
+library(rsample)
+library(kableExtra)
+library(MCS)
+library(knitr)
+library(tseries)
+
+
+
+
+
+
+
+
+```
+
+```{r load and filter data, include=TRUE}
+original_data<-read.csv("data/oxfordmanrealizedvolatilityindices.csv")
+cat(sprintf("Loaded data frame unfiltered :\n"))
+#glimpse(original_data)
+ grouped_count<-original_data %>% 
+   group_by(Symbol) %>% 
+   count()
+
+ s_and_p_count<-grouped_count %>% 
+   filter(Symbol==".SPX")
+ 
+ s_and_p_data<-original_data %>% 
+   filter(Symbol==".SPX")
+
+rv<-s_and_p_data %>% 
+  dplyr::select(X, open_to_close, rv5)
+
+
+
+rv_with_date<-rv %>% 
+  mutate(
+    clean_date=ymd_hms(X,tz="UTC"))
+  
+rv_arranged<-rv_with_date %>% 
+  dplyr::select(clean_date,open_to_close,rv5)
+cat(sprintf("Filtered dataframe :\n"))
+first<-head(rv_arranged,1)
+last<-tail(rv_arranged,1)
+
+#cat(sprintf("From :%s\n",first$clean_date))
+#cat(sprintf("To :%s\n",last$clean_date))
+#glimpse(rv_arranged)
+
+
+##--------test for stationarity
+
+stationarity_results<-adf.test(rv_arranged$rv5)
+stationarity_stat<-stationarity_results$statistic
+stationarity_pvalue<-stationarity_results$p.value
+
+##--------------test for normality
+normality_results<-jarque.bera.test(rv_arranged$rv5)
+normality_stat<-normality_results$statistic
+normality_pvalue<-normality_results$p.value
+
+## pvalue is less than 0.05, reject normality
+##--------------
+
+##-------------
+# Ljung-Box test
+correlation_5_results<-Box.test(rv_arranged$rv5, lag = 5, type = "Ljung-Box")
+cor_5_pvalue<-correlation_5_results$p.value
+cor_5_stat<-correlation_5_results$statistic
+
+correlation_10_results<-Box.test(rv_arranged$rv5, lag = 10, type = "Ljung-Box")
+cor_10_pvalue<-correlation_10_results$p.value
+cor_10_stat<-correlation_10_results$statistic
+
+data_analysis_frame<-data.frame(
+  Test=c("Stationarity","Normality","Autocorrelation (5)","Autocorrelation (10)"),
+  Statistic=c(stationarity_stat,normality_stat,cor_5_stat,cor_10_stat),
+  Pvalue=c(stationarity_pvalue,normality_pvalue,cor_5_pvalue,cor_10_pvalue),
+  conclusions=c("< 0.05","< 0.05","< 0.05","< 0.05")
+)
+data_analysis_frame
+
+
+##-------------
+glimpse(rv_arranged)
+```
+
+```{r making features,(7 days,22 days)}
+expectations<-function(df,c,a=5){
+  
+  
+  #df is the target data frame
+  #a is the horizon, 5 or 22
+  #c is the column of interest
+  # note this method returns a vector of averages for a horizon
+  post_avg_vector=numeric(nrow(df))
+  
+  for(i in a:nrow(df)){
+    if(a==5|a==22){
+      
+      column_of_interest<-df %>%
+        select(c)
+      
+     
+      
+      avg<-mean(column_of_interest[(i-a):i,])
+      post_avg_vector[i]=avg
+      
+      #cat(sprintf("average for t_%s = %s \n",i,avg))
+      
+    }
+  }
+  return(post_avg_vector)
+ 
+  
+  
+}
+cat(print("Making 7 and 22 day features .....\n"))
+final_rv_data<-rv_arranged %>% 
+  mutate(
+    RVw=expectations(rv_arranged,2,a=5),
+    
+    RVm=expectations(rv_arranged,2,a=22)
+  ) 
+
+glimpse(final_rv_data)
+```
+```{r Data Exploration}
+
+options(digits = 6)
+##### ploting the distributio of Realized variance
+returns<-data.frame(r=final_rv_data$rv5)
+lower<-quantile(returns$r,0.25)-2*IQR(returns$r)
+upper<-quantile(returns$r,0.975)-2*IQR(returns$r)
+rv_distribution<-ggplot(
+  returns,
+  aes(x=r))+
+  geom_density(aes(y=after_stat(density)),colour="darkred",linewidth=0.8)+
+  xlim(0,0.00025)+
+
+  geom_histogram(aes(y=after_stat(density)),
+                 bins =50,fill="skyblue",alpha=0.6,color="black")+
+  labs(x="Realized Variance",y="Density",caption = "Source :Author")+
+  theme_minimal()+
+  theme(plot.caption=element_text(h=0.5))
+  
+  
+rv_distribution
+
+
+######## ploting Garch news impact curve for different GARCH Models
+#### coefficients obtained from : https://vlab.stern.nyu.edu/docs/volatility/GJR-GARCH
+#GJR-GARCH=============
+
+omega_g <- 0.090
+alpha_g <- 0.050
+gamma_g <- 0.080
+
+shocks_g<-seq(-0.4,0.4,length.out=100)  
+
+sigma_2_gj<-omega_g+ alpha_g*shocks_g^2+ gamma_g*ifelse(shocks_g<0,1,0)*shocks_g^2
+
+gjr_garch_data<-data.frame(x=shocks_g,y=sigma_2_gj)
+
+
+pos  <- gjr_garch_data[gjr_garch_data$x >= 0, ]
+neg  <- gjr_garch_data[gjr_garch_data$x < 0, ]
+
+
+plot(gjr_garch_data$x, gjr_garch_data$y, type="n",
+     xlab="Absolute Shock", ylab="Conditional Variance",
+    
+     )
+
+title("News Impact Curve - GJR-GARCH")
+mtext("Source: Author", side = 1, line = 4, adj = 0.5)
+
+# continuous line for positive shocks
+lines(pos$x, pos$y, col="blue", lwd=2)
+
+# dashed blue line for negative shocks
+lines(abs(neg$x), neg$y, col="darkred", lwd=2)
+
+legend("topleft", 
+       legend = c("Negative shocks", "Positive shocks"),
+       col = c("darkred", "blue"), 
+       lwd = 2)
+
+
+
+
+#=======================
+
+# GARCH(1,1) News Impact Curve
+
+
+omega <- 0.01
+alpha <- 0.0973
+beta  <- 0.895
+
+# Create sequence of shocks
+eps <- seq(-0.4, 0.4, length.out = 100)
+
+# Compute conditional variance
+sigma2 <- omega + alpha * eps^2
+
+
+neg_idx <- eps < 0
+pos_idx <- eps >= 0
+
+
+# Plot
+plot(abs(eps), sigma2, type = "n", 
+     main = "News Impact Curve - GARCH",
+     xlab = " Absolute Shock",
+     ylab = "Conditional Variance"
+     )
+
+
+
+mtext("Source: Author", side = 1, line = 4, adj = 0.5)
+
+
+lines(abs(eps[pos_idx]), sigma2[pos_idx], col = "black", lwd = 2, lty = 1)
+
+
+lines(abs(eps[neg_idx]), sigma2[neg_idx], col = "darkred", lwd = 6, lty = 2)
+
+legend("topleft", 
+       legend = c("Positive Shocks", "Negative Shocks"),
+       col = c("black", "darkred"), 
+       lwd = 2,
+       lty = c(1, 2))  
+
+#----------------------------------------------------------
+# AVGARCH News Impact Curve
+omega <- 0.00507
+alpha <- 0.0996
+beta  <- 0.918
+gamma <- 0.269
+
+shocks <- seq(-0.4, 0.4, length.out = 100)
+
+# Compute volatility
+sigma_av <- omega + alpha * (abs(shocks) - gamma * shocks)
+
+# Separate negative and positive shocks
+neg_idx <- shocks < 0
+pos_idx <- shocks >= 0
+
+
+# Plot
+plot(shocks, sigma_av, type = "n",
+     main = "News Impact Curve - AVGARCH",
+     xlab = " Absolute Shock",
+     ylab = "Conditional Variance")
+
+
+
+mtext("Source: Author", side = 1, line = 4, adj = 0.5)
+
+# negative shocks in blue
+lines(abs(shocks[neg_idx]), sigma_av[neg_idx], col = "darkred", lwd = 2)
+
+# positive shocks in red
+lines(shocks[pos_idx], sigma_av[pos_idx], col = "blue", lwd = 2)
+
+
+abline(v = 0, lty = 2, col = "gray50")
+
+
+legend("topleft", 
+       legend = c("Negative shocks", "Positive shocks"),
+       col = c("darkred", "blue"), 
+       lwd = 2)
+
+
+#-----------------------------------------------
+
+
+
+
+```
+
+```{r Getting residuals from a HAR model }
+
+
+
+final_rv_data<-final_rv_data %>% 
+  mutate(
+    RVd=lag(rv5,1)
+  ) %>% 
+  select(clean_date,open_to_close,RVm,RVw,RVd,rv5) %>% 
+  filter(RVm>0) %>% 
+  slice(-1)
+
+
+get_residuals<-function(my_data,window_size){
+  #this function takes in a dataframe and spits out residuals from a fitted
+  #har model, estimated with the ols estimator
+  
+  data_splits<-rolling_origin(
+    my_data,
+    initial=window_size,
+    assess = 1,
+    cumulative = FALSE
+    )
+  
+  digest_splits<-map_df(data_splits$splits,function(s){
+  training<-analysis(s)
+  testing<-assessment(s)
+  
+  my_model<-lm(rv5~RVd+RVw+RVm,data = training)
+  
+  expected_variance<-predict(my_model,newdata=testing)
+  the_residual<-testing$rv5-expected_variance
+  
+  results<-data.frame(
+    period=testing$clean_date,
+    forecast=expected_variance,
+    true=testing$rv5,
+    residuals=the_residual
+  )
+  
+  return(results)
+})
+  
+  return(digest_splits)
+  
+}
+
+har_residuals<-get_residuals(final_rv_data,1000)
+
+
+res<-ggplot(har_residuals[1:1000,],aes(x=period,y=residuals,ylim()))+
+  geom_point(color="darkred")+
+  geom_line(color="blue",size=0.1)+theme_minimal()+
+  labs(caption = "Source :Author")+
+  theme(plot.caption=element_text(h=0.5))
+#######################
+res
+
+##--------------test for normality in Residuals
+normality_results<-jarque.bera.test(har_residuals$residuals)
+normality_stat<-normality_results$statistic
+normality_pvalue<-normality_results$p.value
+
+## 
+##--------------
+
+##-------------
+# Ljung-Box test in residuals
+correlation_5_results<-Box.test(har_residuals$residuals, lag = 5, type = "Ljung-Box")
+cor_5_pvalue<-correlation_5_results$p.value
+cor_5_stat<-correlation_5_results$statistic
+
+correlation_10_results<-Box.test(har_residuals$residuals, lag = 10, type = "Ljung-Box")
+cor_10_pvalue<-correlation_10_results$p.value
+cor_10_stat<-correlation_10_results$statistic
+
+data_analysis_frame<-data.frame(
+  Test=c("Normality","Autocorrelation (5)","Autocorrelation (10)"),
+  Statistic=c(normality_stat,cor_5_stat,cor_10_stat),
+  Pvalue=c(normality_pvalue,cor_5_pvalue,cor_10_pvalue),
+  conclusions=c("< 0.05","< 0.05","< 0.05")
+)
+data_analysis_frame
+
+
+
+
+```
+```{r getting different weights from Garch Models}
+###################################
+garch_coefficients<-data.frame(
+  Model=character(3),
+  Omega=numeric(3),
+  Alpha=numeric(3),
+  Beta=numeric(3),
+  Gamma=numeric(3)
+)
+
+garch_pvalues<-data.frame(
+  Model=character(3),
+  Omega=character(3),
+  Alpha=character(3),
+  Beta=character(3),
+  Gamma=character(3)
+)
+
+get_garch_coefficients<-function(fit,model_name,model_index){
+  
+  # function to extract model coefficients
+  
+  omega  <- coef(fit)["omega"]
+  alpha1 <- coef(fit)["alpha1"]
+  beta1  <- coef(fit)["beta1"]
+  gamma1 <- coef(fit)["gamma1"]   
+  mu     <- coef(fit)["mu"]
+  
+
+  p<-fit@fit$matcoef
+  
+  p[, "Pr(>|t|)"] <- format.pval(p[, "Pr(>|t|)"], 
+                                          digits = 3, 
+                                          eps = 0.001)
+  
+  if(nrow(p)==5){
+     pvalues<-data.frame(
+    Model=model_name,
+    Omega=p[2,4],
+    Alpha=p[3,4],
+    Beta=p[4,4],
+    Gamma=p[5,4]
+  )
+    
+    garch_pvalues[model_index,]<<-pvalues
+    
+   
+    
+  }else{
+    pvalues<-data.frame(
+    Model=model_name,
+    Omega=p[2,4],
+    Alpha=p[3,4],
+    Beta=p[4,4],
+    Gamma="NULL"
+  )
+    garch_pvalues[model_index,]<<-pvalues
+  }
+  
+  
+  
+  coefficients<-data.frame(
+  Model=model_name,
+  Omega=omega,
+  Alpha=alpha1,
+  Beta=beta1,
+  Gamma=gamma1
+  )
+  return(coefficients)
+  
+}
+###################################
+get_garch_model_fits<-function(olsResiduals){
+ #this method returns a matrix of conditional variances,
+  # each garch model takes a column of residuals
+  standardized_residuals<-scale(olsResiduals)
+  
+ 
+  
+  sGARCH<-ugarchfit(
+    spec=ugarchspec(
+      variance.model = list(model="sGARCH",garchOrder=c(1,1)),
+      mean.model = list(armaOrder=c(0,0)),
+      distribution.model = "norm"
+    ),
+    data=standardized_residuals,
+    solver = "hybrid"
+  )
+
+  garch_coefficients<-rbind( garch_coefficients[1,]<<-get_garch_coefficients(sGARCH,"sGARCH",1))
+  
+  GJR_GARCH<-ugarchfit(
+    spec=ugarchspec(
+      variance.model = list(model="gjrGARCH",garchOrder=c(1,1)),
+      mean.model = list(armaOrder=c(0,0)),
+      distribution.model = "norm"
+    ),
+    data=standardized_residuals,
+    solver = "hybrid"
+  )
+  
+   garch_coefficients[2,]<<-get_garch_coefficients(GJR_GARCH,"GJR-GARCH",2)
+   
+  AVGARCH<-ugarchfit(
+    spec=ugarchspec(
+      variance.model = list(model="fGARCH",garchOrder=c(1,1),submodel="AVGARCH"),
+      
+      mean.model = list(armaOrder=c(0,0)),
+      distribution.model = "norm"
+    ),
+    data=standardized_residuals,
+    solver = "hybrid"
+  )
+  
+   garch_coefficients[3,]<<-get_garch_coefficients(AVGARCH,"AVGARCH",3)
+  
+  avgarch_vars<-sigma(AVGARCH)^2
+  
+  GJR_GARCH_vars<-sigma(GJR_GARCH)^2
+  
+  sGARCH_vars<-sigma(sGARCH)^2
+  
+  
+  all_data<-data.frame(
+    Weight_sGARCH=sGARCH_vars,
+    Weight_GJR_GARCH=GJR_GARCH_vars,
+    Weight_AVGARCH=avgarch_vars
+   
+  ) 
+  return(all_data)
+}
+##############################
+
+#############################
+
+row.names(garch_coefficients)<-c(1,2,3)
+garch_weights<-get_garch_model_fits(har_residuals$residuals)
+
+
+
+garch_coefficients 
+
+
+  
+```
+
+
+```{r Make predictions}
+
+
+# converting all garch forecasts to 1/sig^2
+
+garch_weights<-garch_weights %>% 
+  mutate(
+    Weight_sGARCH=1/Weight_sGARCH,
+    Weight_GJR_GARCH=1/Weight_GJR_GARCH,
+    Weight_AVGARCH=1/Weight_AVGARCH
+  )
+
+garch_weights %>% 
+  summarise(
+    across(everything(),~mean(.))
+  )
+
+# since we used first 1000 observations for training, we dont have forecsats for them, remove them
+
+final_rv_data_2<-final_rv_data[-(1:1000),]
+data<-cbind(
+  date=final_rv_data_2$clean_date,
+  garch_weights,
+  DayRV=final_rv_data_2$rv5,
+  DayRV_t_1=final_rv_data_2$RVd,
+  WeekRV=final_rv_data_2$RVw,
+  MonthRV=final_rv_data_2$RVm
+  )
+
+
+glimpse(data)
+
+
+## place holders for predictions
+all_predictions<-data.frame(
+  Har_no_weights=numeric(nrow(data)),
+  Har_sGARCH=numeric(nrow(data)),
+  Har_GJR_GARCH=numeric(nrow(data)),
+  Har_AVGARCH=numeric(nrow(data)),
+  p_val_Har=numeric(nrow(data)),
+  p_val_Har_sGARCH=numeric(nrow(data)),
+  p_val_Har_beta_t_e_GARCH=numeric(nrow(data)),
+  p_val_Har_AVGARCH=numeric(nrow(data))
+  
+)
+##
+##_function to extract parameters from the first split
+
+har_coeffs<-data.frame(
+  Model=character(4),
+  Intercept=numeric(4),
+  Day=numeric(4),
+  Week=numeric(4),
+  Month=numeric(4)
+)
+
+har_pvalues<-data.frame(
+   Model=character(4),
+  Intercept=numeric(4),
+  Day=numeric(4),
+  Week=numeric(4),
+  Month=numeric(4)
+)
+
+get_har_coeffs<-function(model,model_name){
+  
+  
+  coeffs<-data.frame(
+  Model=model_name,
+  Intercept=coef(model)[1],
+  Day=coef(model)[2],
+  Week=coef(model)[3],
+  Month=coef(model)[4])
+  
+    
+     
+  pvalues<-data.frame(
+   Model=model_name,
+  Intercept=summary(model)$coefficients[1,4],
+  Day=summary(model)$coefficients[2,4],
+  Week=summary(model)$coefficients[3,4],
+  Month=summary(model)$coefficients[4,4]
+)
+  
+ results<-list(coeffs=coeffs,pvalues=pvalues)
+  
+
+  return(results)
+
+}
+
+
+
+fit_models_for_coeffs<-function(current_window){
+  
+  # extracts coefficients and their pvalues from the current window
+  training<-analysis(current_window)
+  testing<-assessment(current_window)
+  
+  har_model=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training)
+  
+  results_har<-get_har_coeffs(har_model,"HAR")
+  
+  har_coeffs[1,]<<-results_har$coeffs
+  har_pvalues[1,]<<-results_har$pvalues
+  
+    
+  har_garch=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_sGARCH)
+  
+  results_har_garch<-get_har_coeffs(har_garch,"HAR with GARCH weights")
+  har_coeffs[2,]<<-results_har_garch$coeffs
+  har_pvalues[2,]<<-results_har_garch$pvalues
+  
+  
+  
+  har_GJR_GARCH=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_GJR_GARCH)
+  
+  results_gjr_garch<-get_har_coeffs(har_GJR_GARCH,"HAR with GJR-GARCH weights")
+  har_coeffs[3,]<<-results_gjr_garch$coeffs
+  har_pvalues[3,]<<-results_gjr_garch$pvalues
+  
+ 
+  
+  har_AVGARCH=lm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_AVGARCH)
+  
+  results_av_garch<-get_har_coeffs(har_AVGARCH,"HAR with AVGARCH weights")
+  har_coeffs[4,]<<-results_av_garch$coeffs
+  har_pvalues[4,]<<-results_av_garch$pvalues
+  
+  
+  
+  
+
+ 
+  
+}
+
+##
+
+predict_all_har_models<-function(data,window_size){
+
+  the_splits<-rolling_origin(data,initial=window_size,assess = 1,cumulative = FALSE)
+  
+  first_window<-the_splits$splits[[1]]
+  
+  fit_models_for_coeffs(first_window)
+  
+
+  
+  
+  # from each split, return one day ahead forecast and residual
+  out_put<-map_df(the_splits$splits,function(split){
+    training<-analysis(split)
+    testing<-assessment(split)
+    
+  har_model=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training)
+     
+  har_garch=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_sGARCH)
+  
+  har_GJR_GARCH=glm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_GJR_GARCH)
+  
+  har_AVGARCH=lm(DayRV~DayRV_t_1+WeekRV+MonthRV,data=training,weights = Weight_AVGARCH)
+  
+  
+ 
+
+  preds<-data.frame(
+    Har_no_weights=predict(har_model,newdata = testing),
+    
+    Har_sGARCH=predict(har_garch,newdata = testing),
+    
+    har_GJR_GARCH=predict(har_GJR_GARCH,newdata = testing),
+    
+    Har_AVGARCH=predict(har_AVGARCH,newdata = testing)
+  )
+  
+  
+  return(preds)
+  
+  })
+ return(out_put)
+  
+}
+window_size=1000
+
+all_predictions<-predict_all_har_models(data,window_size)
+
+
+glimpse(all_predictions)
+har_coeffs
+har_pvalues
+
+
+
+
+```
+
+
+```{r}
+# get y from original data and get predictions from all_predictions put in one frame
+
+combined<-data.frame(
+  RV=data$DayRV[-(1:1000)],
+  RV_hat_har=all_predictions$Har_no_weights,
+  RV_hat_har_sGARCH=all_predictions$Har_sGARCH,
+  RV_hat_har_GJR_GARCH=all_predictions$har_GJR_GARCH,
+  RV_hat_har_AV=all_predictions$Har_AVGARCH
+)
+
+# get residual^2 for each
+all_residuals<-combined %>% 
+  mutate(
+    RV_hat_har=(RV_hat_har-RV)^2,
+    RV_hat_har_sGARCH=(RV_hat_har_sGARCH-RV)^2,
+    RV_hat_har_GJR_GARCH=(RV_hat_har_GJR_GARCH-RV)^2,
+    RV_hat_har_AV=(RV_hat_har_AV-RV)^2
+    
+  )
+
+
+#get mse
+mse<-all_residuals %>% 
+  summarise(
+    across(everything(),~mean(.))
+  ) %>% 
+  pivot_longer(
+    everything(),names_to ="Model",values_to = "MSE"
+  ) %>% 
+  slice(-1,)
+rownames(mse)<-c("HAR","HAR GARCH","HAR GJR-GARCH", "HAR AV")
+#mse
+
+ordered_mse<-mse %>% 
+  arrange(desc(MSE))
+ 
+
+calc_qlike_val<-function(true_RV,pred_RV){
+  val<-log(pred_RV)+((true_RV)/(pred_RV))
+  
+  return(val)
+}
+
+true_RV<-data$DayRV[-(1:1000)]
+pred_har<-all_predictions$Har_no_weights
+pred_har_sGARCH<-all_predictions$Har_sGARCH
+pred_har_GJR<-all_predictions$har_GJR_GARCH
+pred_har_AV<-all_predictions$Har_AVGARCH
+
+#log(pred_har)+(true_RV/pred_har)
+
+
+qlike_data<- data.frame(
+   q_RV_hat_har=LossVol(realized=true_RV,evaluated =  pred_har, which = "QLIKE"),
+   q_RV_hat_har_sGARCH=LossVol(realized=true_RV,evaluated =pred_har_sGARCH, which = "QLIKE"),
+   q_RV_hat_har_GJR=LossVol(realized=true_RV,evaluated =pred_har_GJR, which = "QLIKE"),
+   q_RV_hat_har_AV=LossVol(realized=true_RV,evaluated =pred_har_AV, which = "QLIKE")
+)
+
+qlike<-qlike_data %>% 
+  summarise(
+    across(everything(),~mean(.))
+  ) %>% 
+  pivot_longer(
+    everything(),names_to = "Model",values_to = "QLIKE"
+  )
+
+
+ordered_qlike<-qlike %>% 
+  arrange((QLIKE))
+
+
+
+
+
+
+scale_factor<-100000000 
+ordered_mse %>% mutate(MSE=MSE*scale_factor)
+
+
+
+ordered_qlike
+
+```
+
+```{r}
+custom_labels <- c("HAR", "HAR AV","HAR GJR-GARCH","HAR GARCH")
+
+mse_plot<-ggplot(ordered_mse,aes(x=Model,y=MSE,fill=Model))+
+  geom_bar(stat="identity",width=0.8)+
+   labs(title = "Model Comparison by MSE",caption = "Source :Author") +
+   scale_x_discrete(labels = custom_labels) + 
+  theme_minimal(base_size = 12)+
+  theme(
+    
+    axis.text.y = element_blank(),
+    plot.caption=element_text(h=0.5)
+  )
+
+mse_plot
+
+```
+
+## Packages used {-}
+ tidyverse [@R-tidyverse], ggplot2 [@R-ggplot2], rugarch [@R-rugarch], 
+tseries [@R-tseries], roll [@R-roll], MCS [@R-MCS], rsample [@R-rsample], 
+e1071 [@R-e1071], knitr [@R-knitr], and kableExtra [@R-kableExtra].
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
