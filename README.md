@@ -1,0 +1,1 @@
+# Impact-of-Weights-on-HAR-model-Accuracy
